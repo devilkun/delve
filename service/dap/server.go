@@ -11,6 +11,7 @@ package dap
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,6 +105,71 @@ type Server struct {
 	sessionMu sync.Mutex
 }
 
+// memRef describe address and its size to stream data from
+type memRef struct {
+	addr uint64
+	size int64
+}
+
+type referencesCollection struct {
+	mu   sync.Mutex
+	refs map[string]memRef
+}
+
+func (r *referencesCollection) get(reference string) (memRef, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ref, ok := r.refs[reference]
+
+	return ref, ok
+}
+
+func isAddressable(v *proc.Variable) bool {
+	if v == nil || v.Unreadable != nil {
+		return false
+	}
+
+	switch v.Kind {
+	case reflect.Slice, reflect.String:
+		return true
+	}
+
+	return false
+}
+
+func (r *referencesCollection) put(v *proc.Variable) string {
+	if !isAddressable(v) {
+		return ""
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.refs == nil {
+		r.refs = make(map[string]memRef)
+	}
+
+	addr := v.Addr
+	if v.Base != 0 {
+		addr = v.Base
+	}
+
+	ref := fmt.Sprintf("0x%x", addr)
+	r.refs[ref] = memRef{addr: addr, size: v.Len}
+
+	return ref
+}
+
+func (r *referencesCollection) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.refs) > 0 {
+		r.refs = make(map[string]memRef)
+	}
+}
+
 // Session is an abstraction for serving and shutting down
 // a DAP debug session with a pre-connected client.
 // TODO(polina): move this to a different file/package
@@ -119,6 +185,8 @@ type Session struct {
 	// Reset at every stop.
 	// See also comment for convertVariable.
 	variableHandles *handlesMap[*fullyQualifiedVariable]
+	// referencesCollection track references map for DAP client
+	referencesCollection referencesCollection
 	// args tracks special settings for handling debug session requests.
 	args launchAttachArgs
 	// exceptionErr tracks the runtime error that last occurred.
@@ -159,12 +227,6 @@ type Session struct {
 	// changeStateMu must be held for a request to protect itself from another goroutine
 	// changing the state of the running process at the same time.
 	changeStateMu sync.Mutex
-
-	// stdoutReader the program's stdout.
-	stdoutReader io.ReadCloser
-
-	// stderrReader the program's stderr.
-	stderrReader io.ReadCloser
 
 	// preTerminatedWG the WaitGroup that needs to wait before sending a terminated event.
 	preTerminatedWG sync.WaitGroup
@@ -780,7 +842,7 @@ func (s *Session) handleRequest(request dap.Message) {
 	case *dap.LoadedSourcesRequest: // Optional (capability 'supportsLoadedSourcesRequest')
 		/*TODO*/ s.onLoadedSourcesRequest(request) // Not yet implemented
 	case *dap.ReadMemoryRequest: // Optional (capability 'supportsReadMemoryRequest')
-		/*TODO*/ s.onReadMemoryRequest(request) // Not yet implemented
+		s.onReadMemoryRequest(request)
 	case *dap.CancelRequest: // Optional (capability 'supportsCancelRequest')
 		/*TODO*/ s.onCancelRequest(request) // Not yet implemented (does this make sense?)
 	case *dap.ModulesRequest: // Optional (capability 'supportsModulesRequest')
@@ -877,7 +939,7 @@ func (s *Session) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsRestartRequest = true
 	response.Body.SupportsSetExpression = false
 	response.Body.SupportsLoadedSourcesRequest = false
-	response.Body.SupportsReadMemoryRequest = false
+	response.Body.SupportsReadMemoryRequest = true
 	response.Body.SupportsCancelRequest = false
 	response.Body.ExceptionBreakpointFilters = []dap.ExceptionBreakpointsFilter{
 		{Filter: proc.UnrecoveredPanic, Label: "Unrecovered Panics", Default: true},
@@ -1060,10 +1122,10 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 	argsToLog.Cwd, _ = filepath.Abs(args.Cwd)
 	s.config.log.Debugf("launching binary '%s' with config: %s", debugbinary, prettyPrint(argsToLog))
 
-	redirected := false
+	remoteOut := false
 	switch args.OutputMode {
 	case "remote":
-		redirected = true
+		remoteOut = true
 	case "local", "":
 		// noting
 	default:
@@ -1072,7 +1134,13 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 		return
 	}
 
-	redirectedFunc := func(stdoutReader io.ReadCloser, stderrReader io.ReadCloser) {
+	if remoteOut && (args.StdoutTo != "" || args.StderrTo != "") {
+		s.sendShowUserErrorResponse(request.Request, FailedToLaunch, "Failed to launch",
+			"output == \"remote\" can not be used together with stdoutTo or stderrTo")
+		return
+	}
+
+	remoteOutFunc := func(stdoutReader io.ReadCloser, stderrReader io.ReadCloser) {
 		runReadFunc := func(reader io.ReadCloser, category string) {
 			defer s.preTerminatedWG.Done()
 			defer reader.Close()
@@ -1107,7 +1175,7 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 
 	if args.NoDebug {
 		s.mu.Lock()
-		cmd, err := s.newNoDebugProcess(debugbinary, args.Args, s.config.Debugger.WorkingDir, redirected)
+		cmd, stdoutReader, stderrReader, err := s.newNoDebugProcess(debugbinary, args.Args, s.config.Debugger.WorkingDir, remoteOut, args.StdinFrom, args.StdoutTo, args.StderrTo)
 		s.mu.Unlock()
 		if err != nil {
 			s.sendShowUserErrorResponse(request.Request, FailedToLaunch, "Failed to launch", err.Error())
@@ -1119,8 +1187,8 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 
 		// Start the program on a different goroutine, so we can listen for disconnect request.
 		go func() {
-			if redirected {
-				redirectedFunc(s.stdoutReader, s.stderrReader)
+			if remoteOut {
+				remoteOutFunc(stdoutReader, stderrReader)
 			}
 
 			if err := cmd.Wait(); err != nil {
@@ -1134,8 +1202,12 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 		return
 	}
 
+	s.config.Debugger.Stdin = args.StdinFrom
+	s.config.Debugger.Stdout = proc.OutputRedirect{Path: args.StdoutTo}
+	s.config.Debugger.Stderr = proc.OutputRedirect{Path: args.StderrTo}
+
 	var closeAll func()
-	if redirected {
+	if remoteOut {
 		var (
 			readers         [2]io.ReadCloser
 			outputRedirects [2]proc.OutputRedirect
@@ -1153,7 +1225,7 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 		s.config.Debugger.Stdout = outputRedirects[0]
 		s.config.Debugger.Stderr = outputRedirects[1]
 
-		redirectedFunc(readers[0], readers[1])
+		remoteOutFunc(readers[0], readers[1])
 		closeAll = func() {
 			for index := range readers {
 				if closeErr := readers[index].Close(); closeErr != nil {
@@ -1218,32 +1290,66 @@ func (s *Session) getPackageDir(pkg string) string {
 
 // newNoDebugProcess is called from onLaunchRequest (run goroutine) and
 // requires holding mu lock. It prepares process exec.Cmd to be started.
-func (s *Session) newNoDebugProcess(program string, targetArgs []string, wd string, redirected bool) (cmd *exec.Cmd, err error) {
+func (s *Session) newNoDebugProcess(program string, targetArgs []string, wd string, remoteOut bool, stdinFrom, stdoutTo, stderrTo string) (cmd *exec.Cmd, stdoutReader, stderrReader io.ReadCloser, err error) {
 	if s.noDebugProcess != nil {
-		return nil, errors.New("another launch request is in progress")
+		return nil, nil, nil, errors.New("another launch request is in progress")
 	}
 
 	cmd = exec.Command(program, targetArgs...)
 	cmd.Stdin, cmd.Dir = os.Stdin, wd
 
-	if redirected {
-		if s.stderrReader, err = cmd.StderrPipe(); err != nil {
-			return nil, err
+	if stdinFrom != "" {
+		fh, err := os.Open(stdinFrom)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("could not open stdin file: %v", err)
+		}
+		cmd.Stdin = fh
+	}
+
+	if remoteOut {
+		if stderrReader, err = cmd.StderrPipe(); err != nil {
+			return nil, nil, nil, err
 		}
 
-		if s.stdoutReader, err = cmd.StdoutPipe(); err != nil {
-			return nil, err
+		if stdoutReader, err = cmd.StdoutPipe(); err != nil {
+			return nil, nil, nil, err
 		}
 	} else {
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		var err error
+		toclose := []*os.File{}
+		create := func(redirect string, dflt *os.File) (f *os.File) {
+			if redirect != "" {
+				f, err = os.Create(redirect)
+				toclose = append(toclose, f)
+
+				return f
+			}
+
+			return dflt
+		}
+		defer func() {
+			for _, f := range toclose {
+				f.Close()
+			}
+		}()
+
+		cmd.Stdout = create(stdoutTo, os.Stdout)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("could not create stdout file: %v", err)
+		}
+
+		cmd.Stderr = create(stderrTo, os.Stderr)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("could not create stderr file: %v", err)
+		}
 	}
 
 	if err = cmd.Start(); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	s.noDebugProcess = &process{Cmd: cmd, exited: make(chan struct{})}
-	return cmd, nil
+	return cmd, stdoutReader, stderrReader, nil
 }
 
 // stopNoDebugProcess is called from Stop (main goroutine) and
@@ -2618,6 +2724,7 @@ func (s *Session) childrenToDAPVariables(v *fullyQualifiedVariable) []dap.Variab
 				VariablesReference: cvarref,
 				IndexedVariables:   getIndexedVariableCount(c),
 				NamedVariables:     getNamedVariableCount(c),
+				MemoryReference:    s.referencesCollection.put(c),
 			}
 		}
 	}
@@ -3121,8 +3228,11 @@ func (s *Session) onRestartRequest(request *dap.RestartRequest) {
 	s.setHaltRequested(true)
 	_, err := s.halt()
 	if err != nil {
-		s.sendErrorResponse(request.Request, FailedToLaunch, "Cannot restart", fmt.Sprintf("cannot restart process: %v", err))
-		return
+		var errProcessExited proc.ErrProcessExited
+		if !errors.As(err, &errProcessExited) {
+			s.sendErrorResponse(request.Request, FailedToLaunch, "Cannot restart", fmt.Sprintf("cannot restart process: %v", err))
+			return
+		}
 	}
 
 	// Cannot restart attached processes
@@ -3314,10 +3424,92 @@ func (s *Session) onLoadedSourcesRequest(request *dap.LoadedSourcesRequest) {
 	s.sendNotYetImplementedErrorResponse(request.Request)
 }
 
-// onReadMemoryRequest sends a not-yet-implemented error response.
-// Capability 'supportsReadMemoryRequest' is not set 'initialize' response.
+// onReadMemoryRequest handles DAP read memory requests
 func (s *Session) onReadMemoryRequest(request *dap.ReadMemoryRequest) {
-	s.sendNotYetImplementedErrorResponse(request.Request)
+	args := request.Arguments
+
+	if args.Count < 0 {
+		s.sendErrorResponse(request.Request, UnableToReadMemory, "Unable to read memory", "negative count")
+		return
+	}
+
+	ref, ok := s.referencesCollection.get(args.MemoryReference)
+	if !ok {
+		s.sendErrorResponse(request.Request, UnableToReadMemory, "Unable to read memory", "unknown memoryReference")
+		return
+	}
+
+	if args.Count == 0 {
+		s.send(makeReadMemoryResponse(request.Request, ref.addr, nil, 0))
+		return
+	}
+
+	endReq := int64(args.Offset + args.Count)
+
+	startRead := min(max(int64(args.Offset), 0), ref.size)
+	endRead := min(max(endReq, 0), ref.size)
+
+	memAddr := ref.addr + uint64(startRead)
+
+	readCount := endRead - startRead
+	if readCount <= 0 {
+		unreadable := max(args.Count, 0)
+
+		s.send(makeReadMemoryResponse(request.Request, memAddr, nil, unreadable))
+		return
+	}
+
+	unreadable := max(int64(args.Count)-readCount, 0)
+
+	data, n, err := s.readTargetMemory(memAddr, readCount)
+	if err != nil {
+		s.sendErrorResponse(request.Request, UnableToReadMemory, "Unable to read memory", err.Error())
+		return
+	}
+
+	if int64(n) < readCount {
+		unreadable += readCount - int64(n)
+	}
+
+	s.send(makeReadMemoryResponse(request.Request, memAddr, data, int(unreadable)))
+}
+
+func (s *Session) readTargetMemory(addr uint64, count int64) (data []byte, n int, err error) {
+	if count <= 0 {
+		return nil, 0, nil
+	}
+
+	buf := make([]byte, count)
+
+	tgrp, unlock := s.debugger.LockTargetGroup()
+	defer unlock()
+
+	n, err = tgrp.Selected.Memory().ReadMemory(buf, addr)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if n > 0 {
+		data = buf[:n]
+	}
+
+	return data, n, nil
+}
+
+func makeReadMemoryResponse(req dap.Request, addr uint64, data []byte, unreadable int) *dap.ReadMemoryResponse {
+	var response string
+	if len(data) > 0 {
+		response = base64.StdEncoding.EncodeToString(data)
+	}
+
+	return &dap.ReadMemoryResponse{
+		Response: *newResponse(req),
+		Body: dap.ReadMemoryResponseBody{
+			Address:         fmt.Sprintf("%#x", addr),
+			Data:            response,
+			UnreadableBytes: unreadable,
+		},
+	}
 }
 
 var invalidInstruction = dap.DisassembledInstruction{
@@ -3773,6 +3965,7 @@ Use 'Continue' to resume the original step command.`
 func (s *Session) resetHandlesForStoppedEvent() {
 	s.stackFrameHandles.reset()
 	s.variableHandles.reset()
+	s.referencesCollection.reset()
 	s.exceptionErr = nil
 }
 

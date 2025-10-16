@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"cmp"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -6548,9 +6551,6 @@ func TestOptionalNotYetImplementedResponses(t *testing.T) {
 		client.LoadedSourcesRequest()
 		expectNotYetImplemented("loadedSources")
 
-		client.ReadMemoryRequest()
-		expectNotYetImplemented("readMemory")
-
 		client.CancelRequest()
 		expectNotYetImplemented("cancel")
 
@@ -7795,6 +7795,7 @@ func TestSetExceptionBreakpoints(t *testing.T) {
 					// on the target's panic and runTestBuildFlags, which expects a
 					// terminated event, will fail the test.
 				},
+				disconnect: true,
 			}},
 		)
 	}, 0, true)
@@ -7896,6 +7897,10 @@ func TestRedirect(t *testing.T) {
 }
 
 func TestBreakpointAfterDisconnect(t *testing.T) {
+	if runtime.GOOS == "freebsd" {
+		// This test when run on FreeBSD will cause subsequent tests to sometimes fail.
+		t.Skip("causes problems")
+	}
 	fixture := protest.BuildFixture(t, "testnextnethttp", protest.AllNonOptimized)
 
 	cmd := exec.Command(fixture.Path)
@@ -7984,6 +7989,193 @@ func TestBreakpointAfterDisconnect(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	cmd.Process.Kill()
+}
+
+func TestRedirects(t *testing.T) {
+	var (
+		infile  = "redirect-input.txt"
+		outfile = "redirect-output.txt"
+	)
+	runTest(t, "redirect", func(client *daptest.Client, fixture protest.Fixture) {
+		infile = filepath.Join(filepath.Dir(fixture.Source), infile)
+		outfile = filepath.Join(filepath.Dir(fixture.Source), outfile)
+		client.InitializeRequest()
+		client.ExpectInitializeResponseAndCapabilities(t)
+		client.LaunchRequestWithArgs(map[string]any{
+			"mode": "exec", "program": fixture.Path, "stdinFrom": infile, "stdoutTo": outfile,
+		})
+		client.ExpectProcessEvent(t)
+		client.ExpectInitializedEvent(t)
+		client.ExpectLaunchResponse(t)
+
+		client.ContinueRequest(1)
+		client.ExpectContinueResponse(t)
+		client.ExpectTerminatedEvent(t)
+
+		buf, err := os.ReadFile(outfile)
+		if err != nil {
+			t.Fatalf("error reading output file: %v", err)
+		}
+		t.Logf("output %q", buf)
+		if !strings.HasPrefix(string(buf), "Redirect test") {
+			t.Fatalf("Wrong output %q", string(buf))
+		}
+
+		client.RestartRequest(map[string]any{
+			"arguments": map[string]any{
+				"request": "launch",
+				"rebuild": false,
+			},
+		})
+		client.ExpectRestartResponse(t)
+		client.ExpectInitializedEvent(t)
+
+		client.ContinueRequest(1)
+		client.ExpectContinueResponse(t)
+		client.ExpectTerminatedEvent(t)
+
+		buf2, err := os.ReadFile(outfile)
+		if err != nil {
+			t.Fatalf("error reading output file (second time): %v", err)
+		}
+		t.Logf("output %q", buf2)
+		if !strings.HasPrefix(string(buf2), "Redirect test") {
+			t.Fatalf("Wrong output (second time) %q", string(buf))
+		}
+		if string(buf2) == string(buf) {
+			t.Fatalf("Expected output change got %q", string(buf))
+		}
+		os.Remove(outfile)
+
+		client.DisconnectRequest()
+		client.ExpectOutputEvent(t)
+		client.ExpectOutputEvent(t)
+		client.ExpectDisconnectResponse(t)
+	})
+}
+
+func TestReadMemory_StringPagination(t *testing.T) {
+	if runtime.GOOS == "freebsd" {
+		t.Skip("test skipped on freebsd")
+	}
+
+	runTest(t, "readmem_json", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Breakpoints are set within the program
+			fixture.Source, []int{},
+			[]onBreakpoint{
+				{
+					execute:    func() {},
+					disconnect: false,
+				},
+				{
+					execute: func() {
+						client.StackTraceRequest(1, 0, 20)
+						_ = client.ExpectStackTraceResponse(t)
+
+						client.ScopesRequest(1000)
+						_ = client.ExpectScopesResponse(t)
+
+						client.VariablesRequest(localsScope)
+						locals := client.ExpectVariablesResponse(t)
+						if locals == nil {
+							t.Fatal("wanted local variables, got 0")
+						}
+
+						mustGetByName := func(vars []dap.Variable, names ...string) (map[string]dap.Variable, error) {
+							res := make(map[string]dap.Variable)
+
+							for _, n := range names {
+								idx := slices.IndexFunc(vars, func(v dap.Variable) bool {
+									return v.Name == n
+								})
+
+								if idx == -1 {
+									return nil, fmt.Errorf("%s not found", n)
+								}
+
+								res[n] = vars[idx]
+							}
+
+							return res, nil
+						}
+
+						varIdx, err := mustGetByName(locals.Body.Variables,
+							"jsonString",
+							"jsonHash",
+							"jsonAddr",
+							"bytesString",
+							"nonprint",
+						)
+						if err != nil {
+							t.Fatal(err)
+						}
+
+						longString := varIdx["jsonString"]
+
+						if strings.Trim(varIdx["jsonAddr"].Value, `"`) != longString.MemoryReference {
+							t.Fatal("bad memory address")
+						}
+
+						got := readVarByChunk(t, client, longString, 64)
+						hashed := sha256.Sum256(got.Bytes())
+						hashString := hex.EncodeToString(hashed[:])
+
+						if strings.Trim(varIdx["jsonHash"].Value, `"`) != hashString {
+							t.Fatal("we got wrong values")
+						}
+
+						bytes := readVarByChunk(t, client, varIdx["bytesString"], 1)
+
+						if bytes.String() != "this\nis\nit" {
+							t.Fail()
+						}
+
+						nonp := readVarByChunk(t, client, varIdx["nonprint"], 1)
+						want := []byte{242, 243, 244, 245}
+
+						for i, b := range nonp.Bytes() {
+							if want[i] != b {
+								t.Fail()
+							}
+						}
+					},
+					disconnect: true,
+				}})
+	})
+}
+
+func readVarByChunk(t *testing.T, client *daptest.Client, v dap.Variable, chunk int) bytes.Buffer {
+	t.Helper()
+
+	var got bytes.Buffer
+
+	for off := 0; ; off += chunk {
+		count := chunk
+		client.ReadMemoryRequest(v.MemoryReference, off, count)
+		rm := client.ExpectReadMemoryResponse(t)
+
+		if rm.Body.Data == "" {
+			break
+		}
+
+		data, err := base64.StdEncoding.DecodeString(rm.Body.Data)
+		if err != nil {
+			t.Fatalf("base64 decode failed: %v", err)
+		}
+
+		got.Write(data)
+
+		if len(data) < count {
+			break
+		}
+	}
+
+	return got
 }
 
 type discard struct {

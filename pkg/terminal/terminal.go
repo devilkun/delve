@@ -17,6 +17,7 @@ import (
 	"github.com/go-delve/liner"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/locspec"
 	"github.com/go-delve/delve/pkg/terminal/colorize"
 	"github.com/go-delve/delve/pkg/terminal/starbind"
@@ -83,6 +84,10 @@ type Term struct {
 
 	downloadsMu         sync.Mutex
 	downloadsInProgress bool
+
+	goVersionCache *goversion.GoVersion
+	// customCommandsInvalidated is set when a runCmd is executed during custom command execution
+	customCommandsInvalidated []bool
 }
 
 type displayEntry struct {
@@ -309,18 +314,14 @@ func (t *Term) Run() (int, error) {
 	signal.Notify(ch, syscall.SIGINT)
 	go t.sigintGuard(ch, multiClient)
 
-	fns := trie.New[any]()
 	cmds := trie.New[any]()
-	funcs, _ := t.client.ListFunctions("", 0)
-	for _, fn := range funcs {
-		fns.Add(fn, nil)
-	}
 	for _, cmd := range t.cmds.cmds {
 		for _, alias := range cmd.aliases {
 			cmds.Add(alias, nil)
 		}
 	}
 
+	var fns *trie.Trie[any]
 	var locs *trie.Trie[any]
 
 	t.line.SetCompleter(func(line string) (c []string) {
@@ -329,6 +330,13 @@ func (t *Term) Run() (int, error) {
 		case "break", "trace", "continue":
 			if spc := strings.LastIndex(line, " "); spc > 0 {
 				prefix := line[:spc] + " "
+				if fns == nil {
+					fns = trie.New[any]()
+					funcs, _ := t.client.ListFunctions("", 0)
+					for _, fn := range funcs {
+						fns.Add(fn, nil)
+					}
+				}
 				funcs := fns.FuzzySearch(line[spc+1:])
 				for _, f := range funcs {
 					c = append(c, prefix+f)
@@ -648,6 +656,7 @@ func (t *Term) printDisplays() {
 
 func (t *Term) onStop() {
 	t.printDisplays()
+	t.cmds.executeBreakpointCustomCommands(t)
 }
 
 func (t *Term) longCommandCancel() {
@@ -671,6 +680,16 @@ func (t *Term) longCommandCanceled() bool {
 // RedirectTo redirects the output of this terminal to the specified writer.
 func (t *Term) RedirectTo(w io.Writer) {
 	t.stdout.pw.w = w
+}
+
+func (t *Term) goVersion() *goversion.GoVersion {
+	if t.goVersionCache != nil {
+		return t.goVersionCache
+	}
+	vers := t.client.GetVersion()
+	v, _ := goversion.Parse(vers.TargetGoVersion)
+	t.goVersionCache = &v
+	return t.goVersionCache
 }
 
 // isErrProcessExited returns true if `err` is an RPC error equivalent of proc.ErrProcessExited

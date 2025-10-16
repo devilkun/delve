@@ -341,9 +341,6 @@ func TestGeneratedDoc(t *testing.T) {
 		//TODO(alexsaezm): finish CI integration
 		t.Skip("skipping test on Linux/PPC64LE in CI")
 	}
-	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 24) {
-		t.Skip("disabled due to export format changes")
-	}
 	// Checks gen-cli-docs.go
 	var generatedBuf bytes.Buffer
 	commands := terminal.DebugCommands(nil)
@@ -520,6 +517,9 @@ func TestTypecheckRPC(t *testing.T) {
 			continue
 		case "SetReturnValuesLoadConfig", "Disconnect", "SetEventsFn":
 			// support functions
+			continue
+		case "GetVersion":
+			// rpccommon.go method
 			continue
 		}
 
